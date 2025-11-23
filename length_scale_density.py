@@ -7,11 +7,9 @@ Length Scale Driven Density Field Method for Sparse Image Contour Extraction
 1. 长度标尺场计算
 2. 密度场建模与插值
 3. 各向异性扩散平滑
-4. Mean-Shift梯度迭代
-5. 等密度线提取与持久性分析
-6. 能量演化与样条平滑
+4. 基于梯度的外轮廓提取
 
-依赖: numpy, scipy, opencv-python, scikit-image
+依赖: numpy, scipy, opencv-python
 """
 
 import os
@@ -22,7 +20,6 @@ import cv2
 from scipy.spatial import Delaunay, cKDTree
 from scipy.ndimage import gaussian_filter
 from scipy.interpolate import griddata, RBFInterpolator
-from skimage import measure
 from typing import Tuple, List, Optional
 import warnings
 warnings.filterwarnings('ignore')
@@ -280,88 +277,98 @@ def mean_shift_contour(points_xy: np.ndarray,
 
 
 # ============================================================================
-# 5. 等密度线提取与持久性分析
+# 5. 基于梯度的外轮廓提取
 # ============================================================================
 
-def extract_isolines(density_field: np.ndarray,
-                    tau: float,
-                    min_length: int = 50) -> List[np.ndarray]:
+def extract_gradient_descent_contours(
+    density_field: np.ndarray,
+    step_size: float = 1.2,
+    max_steps: int = 300,
+    grad_threshold: float = 1e-3,
+    start_percentile: float = 60.0,
+    sample_stride: int = 4,
+    min_length: int = 25
+) -> List[np.ndarray]:
     """
-    使用marching squares提取等密度线
-    
+    基于密度梯度的外轮廓提取。
+
+    通过在密度场的高梯度区域撒点并沿负梯度方向做最速下降，
+    收集能够到达边界或梯度平坦区域的路径，适用于稀疏密度场。
+
     参数:
         density_field: (H, W) 密度场
-        tau: 密度阈值
-        min_length: 最小轮廓长度
-    
-    返回:
-        contours: 轮廓列表，每个为 (M, 2) 数组
-    """
-    # 使用skimage的find_contours
-    contours = measure.find_contours(density_field, tau)
-    
-    # 过滤短轮廓
-    valid_contours = []
-    for contour in contours:
-        if len(contour) >= min_length:
-            # 转换为 (x, y) 格式
-            contour_xy = contour[:, ::-1]  # (row, col) -> (x, y)
-            valid_contours.append(contour_xy)
-    
-    return valid_contours
+        step_size: 梯度下降的步长
+        max_steps: 每条轨迹的最大迭代步数
+        grad_threshold: 梯度幅值低于该值视为收敛
+        start_percentile: 作为起点的梯度幅值分位数
+        sample_stride: 起点网格采样间隔，用于覆盖密度稀疏区域
+        min_length: 保留的最短轨迹长度
 
-
-def persistence_filter(density_field: np.ndarray,
-                      contours: List[np.ndarray],
-                      tau_range: Tuple[float, float] = None,
-                      n_levels: int = 10) -> List[np.ndarray]:
-    """
-    拓扑持久性分析，选择最稳定的轮廓
-    
-    参数:
-        density_field: (H, W) 密度场
-        contours: 候选轮廓列表
-        tau_range: 密度阈值范围
-        n_levels: 测试的密度层级数
-    
     返回:
-        persistent_contours: 持久性最强的轮廓
+        contours: 梯度下降得到的外轮廓轨迹列表
     """
-    if not contours:
-        return []
-    
-    if tau_range is None:
-        tau_range = (np.percentile(density_field, 30), 
-                    np.percentile(density_field, 70))
-    
-    # 在多个密度层级上提取轮廓
-    tau_levels = np.linspace(tau_range[0], tau_range[1], n_levels)
-    
-    # 计算每个轮廓的持久性（在多少个层级上出现）
-    contour_persistence = []
-    
-    for contour in contours:
-        # 计算轮廓的面积（作为特征）
-        area = cv2.contourArea(contour.astype(np.float32))
-        
-        # 计算轮廓的平均密度
-        x_coords = np.clip(contour[:, 0].astype(int), 0, density_field.shape[1] - 1)
-        y_coords = np.clip(contour[:, 1].astype(int), 0, density_field.shape[0] - 1)
-        mean_density = np.mean(density_field[y_coords, x_coords])
-        
-        # 持久性得分：面积 + 密度稳定性
-        persistence_score = area * (1.0 + 1.0 / (np.std(density_field[y_coords, x_coords]) + 1e-6))
-        contour_persistence.append((persistence_score, contour))
-    
-    # 按持久性排序
-    contour_persistence.sort(reverse=True, key=lambda x: x[0])
-    
-    # 返回最持久的轮廓
-    return [c for _, c in contour_persistence[:3]]
+    H, W = density_field.shape
+    grad_y, grad_x = np.gradient(density_field)
+    grad_mag = np.hypot(grad_x, grad_y)
+
+    start_thresh = np.percentile(grad_mag, start_percentile)
+    high_grad_mask = grad_mag >= start_thresh
+
+    # 在高梯度区域撒点，同时结合规则网格保证稀疏区也被探索
+    seeds = []
+    high_grad_points = np.argwhere(high_grad_mask)
+    for idx in range(0, len(high_grad_points), max(1, sample_stride)):
+        y, x = high_grad_points[idx]
+        seeds.append((x + 0.5, y + 0.5))
+    for y in range(0, H, sample_stride * 2):
+        for x in range(0, W, sample_stride * 2):
+            seeds.append((x + 0.5, y + 0.5))
+
+    visited = np.zeros((H, W), dtype=bool)
+    contours: List[np.ndarray] = []
+
+    for sx, sy in seeds:
+        xi, yi = int(np.clip(sx, 0, W - 1)), int(np.clip(sy, 0, H - 1))
+        if visited[yi, xi]:
+            continue
+
+        path = []
+        point = np.array([sx, sy], dtype=np.float64)
+
+        for _ in range(max_steps):
+            px = int(np.clip(point[0], 0, W - 1))
+            py = int(np.clip(point[1], 0, H - 1))
+
+            visited[py, px] = True
+            gx = grad_x[py, px]
+            gy = grad_y[py, px]
+            gmag = grad_mag[py, px]
+
+            path.append(point.copy())
+
+            if gmag < grad_threshold:
+                break
+
+            direction = -np.array([gx, gy]) / (gmag + 1e-8)
+            next_point = point + direction * step_size
+
+            point = np.array([
+                np.clip(next_point[0], 0, W - 1),
+                np.clip(next_point[1], 0, H - 1)
+            ])
+
+            if point[0] in (0, W - 1) or point[1] in (0, H - 1):
+                path.append(point.copy())
+                break
+
+        if len(path) >= min_length:
+            contours.append(np.array(path))
+
+    return contours
 
 
 # ============================================================================
-# 6. 能量演化与样条平滑
+# 6. 能量演化与样条平滑（当前未在pipeline中启用）
 # ============================================================================
 
 def elastic_smoothing(contour: np.ndarray,
@@ -469,22 +476,18 @@ def spline_smooth(contour: np.ndarray, smoothness: float = 0.5) -> np.ndarray:
 
 def length_scale_density_pipeline(img: np.ndarray,
                                  tau_percentile: float = 70.0,
-                                 alpha: float = 0.2,
-                                 beta: float = 0.6,
-                                 gamma: float = 3.0,
                                  diffusion_iter: int = 10,
-                                 meanshift_iter: int = 50,
-                                 elastic_iter: int = 20) -> Tuple[List[np.ndarray], np.ndarray]:
+                                 gradient_steps: int = 300,
+                                 sample_stride: int = 4) -> Tuple[List[np.ndarray], np.ndarray]:
     """
     完整的长度标尺驱动密度场轮廓提取pipeline
     
     参数:
         img: 输入灰度图像
-        tau_percentile: 密度阈值百分位数
-        alpha, beta, gamma: 能量演化参数
+        tau_percentile: 梯度起点的密度梯度分位阈值
         diffusion_iter: 扩散迭代次数
-        meanshift_iter: Mean-Shift迭代次数
-        elastic_iter: 弹性平滑迭代次数
+        gradient_steps: 梯度下降的最大迭代步数
+        sample_stride: 撒点步长，控制稀疏区域的采样密度
     
     返回:
         contours: 提取的轮廓列表
@@ -526,40 +529,19 @@ def length_scale_density_pipeline(img: np.ndarray,
     print("步骤5: 各向异性扩散平滑...")
     density_smooth = anisotropic_diffusion(density_field, iterations=diffusion_iter)
     
-    # 6. 确定密度阈值
-    tau = np.percentile(density_smooth, tau_percentile)
-    print(f"步骤6: 密度阈值 τ = {tau:.4f} (第{tau_percentile}百分位)")
-    
-    # 7. Mean-Shift梯度迭代
-    print("步骤7: Mean-Shift梯度迭代...")
-    converged_points = mean_shift_contour(points_xy, density_smooth, tau, 
-                                         eta=0.3, max_iter=meanshift_iter)
-    
-    # 8. 提取等密度线
-    print("步骤8: 提取等密度线...")
-    isolines = extract_isolines(density_smooth, tau, min_length=50)
-    print(f"  提取了 {len(isolines)} 条等密度线")
-    
-    # 9. 持久性分析
-    print("步骤9: 拓扑持久性分析...")
-    if isolines:
-        persistent_contours = persistence_filter(density_smooth, isolines)
-        print(f"  选择了 {len(persistent_contours)} 条持久轮廓")
-    else:
-        persistent_contours = []
-    
-    # 10. 能量演化与样条平滑
-    print("步骤10: 能量演化与样条平滑...")
-    final_contours = []
-    for contour in persistent_contours:
-        smoothed = elastic_smoothing(contour, density_smooth, tau,
-                                    alpha=alpha, beta=beta, gamma=gamma,
-                                    iterations=elastic_iter)
-        final_contours.append(smoothed)
-    
-    print(f"完成! 最终得到 {len(final_contours)} 条轮廓")
-    
-    return final_contours, density_smooth
+    # 6. 基于梯度的外轮廓提取
+    print("步骤6: 基于梯度的外轮廓提取...")
+    gradient_contours = extract_gradient_descent_contours(
+        density_smooth,
+        max_steps=gradient_steps,
+        start_percentile=tau_percentile,
+        sample_stride=sample_stride
+    )
+    print(f"  梯度下降得到 {len(gradient_contours)} 条候选轮廓")
+
+    print(f"完成! 最终得到 {len(gradient_contours)} 条轮廓")
+
+    return gradient_contours, density_smooth
 
 
 # ============================================================================
@@ -616,19 +598,13 @@ def main():
     parser.add_argument('--output', default='data/output/length_scale_result.png',
                        help='输出图像路径')
     parser.add_argument('--tau-percentile', type=float, default=65.0,
-                       help='密度阈值百分位数 (default: 65.0)')
-    parser.add_argument('--alpha', type=float, default=0.2,
-                       help='拉伸平滑权重 (default: 0.2)')
-    parser.add_argument('--beta', type=float, default=0.6,
-                       help='弯曲平滑权重 (default: 0.6)')
-    parser.add_argument('--gamma', type=float, default=3.0,
-                       help='密度吸附权重 (default: 3.0)')
+                       help='梯度起点选择的分位阈值 (default: 65.0)')
     parser.add_argument('--diffusion-iter', type=int, default=10,
                        help='扩散迭代次数 (default: 10)')
-    parser.add_argument('--meanshift-iter', type=int, default=50,
-                       help='Mean-Shift迭代次数 (default: 50)')
-    parser.add_argument('--elastic-iter', type=int, default=20,
-                       help='弹性平滑迭代次数 (default: 20)')
+    parser.add_argument('--gradient-steps', type=int, default=300,
+                       help='梯度下降最大步数 (default: 300)')
+    parser.add_argument('--sample-stride', type=int, default=4,
+                       help='梯度撒点间隔，控制稀疏区域覆盖 (default: 4)')
     
     args = parser.parse_args()
     
@@ -645,12 +621,9 @@ def main():
     contours, density_field = length_scale_density_pipeline(
         img,
         tau_percentile=args.tau_percentile,
-        alpha=args.alpha,
-        beta=args.beta,
-        gamma=args.gamma,
         diffusion_iter=args.diffusion_iter,
-        meanshift_iter=args.meanshift_iter,
-        elastic_iter=args.elastic_iter
+        gradient_steps=args.gradient_steps,
+        sample_stride=args.sample_stride
     )
     
     # 可视化结果
